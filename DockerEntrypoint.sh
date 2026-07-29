@@ -80,7 +80,10 @@ fi
 
 if [ -n "$XUI_INIT_WEB_BASE_PATH" ]; then
     echo "Setting webBasePath to: $XUI_INIT_WEB_BASE_PATH"
-    /app/x-ui setting -webBasePath "$XUI_INIT_WEB_BASE_PATH"
+    /app/x-ui setting -webBasePath "$XUI_INIT_WEB_BASE_PATH" || true
+    if [ -f /etc/x-ui/x-ui.db ] && command -v sqlite3 >/dev/null 2>&1; then
+        sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value = '$XUI_INIT_WEB_BASE_PATH' WHERE key = 'webBasePath';" || true
+    fi
 fi
 
 # Run x-ui
