@@ -78,5 +78,9 @@ if [ -f /root/.acme.sh/acme.sh ]; then
     crond
 fi
 
+if [ -n "$XUI_INIT_WEB_BASE_PATH" ]; then
+    /app/x-ui setting -webBasePath "$XUI_INIT_WEB_BASE_PATH" >/dev/null 2>&1
+fi
+
 # Run x-ui
 exec /app/x-ui
