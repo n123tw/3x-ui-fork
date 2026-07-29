@@ -243,7 +243,11 @@ func (s *Server) initRouter() (*gin.Engine, error) {
 	// rendering a legacy template.
 	controller.SetDistFS(distFS)
 
-	g := engine.Group(basePath)
+	groupPath := basePath
+	if groupPath == "/" {
+		groupPath = ""
+	}
+	g := engine.Group(groupPath)
 
 	s.index = controller.NewIndexController(g)
 	s.panel = controller.NewXUIController(g)
