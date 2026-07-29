@@ -71,6 +71,11 @@ func runWebServer() {
 		log.Fatalf("Error initializing database: %v", err)
 	}
 
+	if envBasePath := os.Getenv("XUI_INIT_WEB_BASE_PATH"); envBasePath != "" {
+		settingService := service.SettingService{}
+		_ = settingService.SetBasePath(envBasePath)
+	}
+
 	var server *web.Server
 	server = web.NewServer()
 	global.SetWebServer(server)
