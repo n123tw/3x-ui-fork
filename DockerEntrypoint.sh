@@ -79,7 +79,8 @@ if [ -f /root/.acme.sh/acme.sh ]; then
 fi
 
 if [ -n "$XUI_INIT_WEB_BASE_PATH" ]; then
-    /app/x-ui setting -webBasePath "$XUI_INIT_WEB_BASE_PATH" >/dev/null 2>&1
+    echo "Setting webBasePath to: $XUI_INIT_WEB_BASE_PATH"
+    /app/x-ui setting -webBasePath "$XUI_INIT_WEB_BASE_PATH"
 fi
 
 # Run x-ui
