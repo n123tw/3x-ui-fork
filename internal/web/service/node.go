@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/crypto/nodetoken"
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
@@ -30,15 +32,16 @@ import (
 )
 
 type HeartbeatPatch struct {
-	Status        string
-	LastHeartbeat int64
-	LatencyMs     int
-	XrayVersion   string
-	PanelVersion  string
-	Guid          string
-	CpuPct        float64
-	MemPct        float64
-	UptimeSecs    uint64
+	Status             string
+	LastHeartbeat      int64
+	LatencyMs          int
+	XrayVersion        string
+	PanelVersion       string
+	Guid               string
+	CpuPct             float64
+	MemPct             float64
+	UptimeSecs         uint64
+	UnavailableMetrics []string
 	// NetUp/NetDown are the node's current interface throughput (bytes/sec),
 	// summed over non-virtual interfaces, read from its status response.
 	NetUp     uint64
@@ -100,12 +103,32 @@ func (s *NodeService) FetchCertFingerprint(ctx context.Context, n *model.Node) (
 	return base64.StdEncoding.EncodeToString(sum[:]), nil
 }
 
+// decryptToken exposes plaintext to callers. Failures blank only this token
+// and surface through LastError instead of dropping the node row.
+func decryptToken(n *model.Node) {
+	if n == nil || n.ApiToken == "" {
+		return
+	}
+	pt, err := nodetoken.Decrypt(n.Id, n.ApiToken)
+	if err != nil {
+		n.ApiToken = ""
+		if n.LastError == "" {
+			n.LastError = "token decrypt failed: " + err.Error()
+		}
+		return
+	}
+	n.ApiToken = pt
+}
+
 func (s *NodeService) GetAll() ([]*model.Node, error) {
 	db := database.GetDB()
 	var nodes []*model.Node
 	err := db.Model(model.Node{}).Order("id asc").Find(&nodes).Error
 	if err != nil || len(nodes) == 0 {
 		return nodes, err
+	}
+	for _, n := range nodes {
+		decryptToken(n)
 	}
 
 	type inboundRow struct {
@@ -333,6 +356,7 @@ func (s *NodeService) GetById(id int) (*model.Node, error) {
 	if err := db.Model(model.Node{}).Where("id = ?", id).First(n).Error; err != nil {
 		return nil, err
 	}
+	decryptToken(n)
 	return n, nil
 }
 
@@ -429,7 +453,29 @@ func (s *NodeService) Create(n *model.Node) error {
 		return err
 	}
 	db := database.GetDB()
-	return db.Create(n).Error
+	if !nodetoken.Enabled() {
+		return db.Create(n).Error
+	}
+	plaintext := n.ApiToken
+	return db.Transaction(func(tx *gorm.DB) error {
+		// The id-bound ciphertext can only be produced after insertion. Never put
+		// plaintext in the initial tuple: PostgreSQL WAL would retain it.
+		n.ApiToken = ""
+		defer func() { n.ApiToken = plaintext }()
+		if err := tx.Create(n).Error; err != nil {
+			return err
+		}
+		enc, err := nodetoken.Encrypt(n.Id, plaintext)
+		if err != nil {
+			return err
+		}
+		if enc == plaintext {
+			return nil // off-mode / empty token: nothing to rewrite
+		}
+		// DB column gets ciphertext; the in-memory struct keeps plaintext so the
+		// create response echoes the same usable value GetById would return.
+		return tx.Model(model.Node{}).Where("id = ?", n.Id).Update("api_token", enc).Error
+	})
 }
 
 func (s *NodeService) CreateFromRequest(req *NodeMutationRequest) (*NodeView, error) {
@@ -441,6 +487,24 @@ func (s *NodeService) CreateFromRequest(req *NodeMutationRequest) (*NodeView, er
 		return nil, err
 	}
 	return toNodeView(n), nil
+}
+
+// nodeSelectionGrew reports a save that starts managing inbounds the panel has
+// not imported yet; the sweep must wait for the next clean sync to adopt them.
+func nodeSelectionGrew(existing, in *model.Node) bool {
+	if in.InboundSyncMode != "selected" {
+		return existing.InboundSyncMode == "selected"
+	}
+	old := make(map[string]struct{}, len(existing.InboundTags))
+	for _, tag := range existing.InboundTags {
+		old[tag] = struct{}{}
+	}
+	for _, tag := range in.InboundTags {
+		if _, ok := old[tag]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *NodeService) Update(id int, in *model.Node) error {
@@ -456,6 +520,15 @@ func (s *NodeService) Update(id int, in *model.Node) error {
 	if err := db.Where("id = ?", id).First(existing).Error; err != nil {
 		return err
 	}
+	// Blank means keep the hidden stored token; non-blank values are encrypted.
+	apiToken := existing.ApiToken
+	if in.ApiToken != "" {
+		enc, eerr := nodetoken.Encrypt(id, in.ApiToken)
+		if eerr != nil {
+			return eerr
+		}
+		apiToken = enc
+	}
 	updates := map[string]any{
 		"name":                  in.Name,
 		"remark":                in.Remark,
@@ -463,7 +536,7 @@ func (s *NodeService) Update(id int, in *model.Node) error {
 		"address":               in.Address,
 		"port":                  in.Port,
 		"base_path":             in.BasePath,
-		"api_token":             in.ApiToken,
+		"api_token":             apiToken,
 		"enable":                in.Enable,
 		"allow_private_address": in.AllowPrivateAddress,
 		"tls_verify_mode":       in.TlsVerifyMode,
@@ -471,6 +544,9 @@ func (s *NodeService) Update(id int, in *model.Node) error {
 		"inbound_sync_mode":     in.InboundSyncMode,
 		"inbound_tags":          string(inboundTagsJSON),
 		"outbound_tag":          in.OutboundTag,
+	}
+	if nodeSelectionGrew(existing, in) {
+		updates["inbounds_adopted_at"] = 0
 	}
 	if err := db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
@@ -508,7 +584,10 @@ func (s *NodeService) UpdateFromRequest(id int, req *NodeMutationRequest) error 
 	case req.ClearApiToken:
 		apiToken = ""
 	case req.ApiToken != nil:
-		apiToken = *req.ApiToken
+		apiToken, err = nodetoken.Encrypt(id, *req.ApiToken)
+		if err != nil {
+			return err
+		}
 	}
 	if apiToken == "" && in.Enable && in.TlsVerifyMode != "mtls" {
 		return common.NewError("apiToken is required unless mtls is enabled")
@@ -529,11 +608,16 @@ func (s *NodeService) UpdateFromRequest(id int, req *NodeMutationRequest) error 
 		"inbound_tags":          string(inboundTagsJSON),
 		"outbound_tag":          in.OutboundTag,
 	}
-	if err := db.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-		return err
+	if nodeSelectionGrew(existing, in) {
+		updates["inbounds_adopted_at"] = 0
 	}
-	if dErr := s.MarkNodeDirty(id); dErr != nil {
-		logger.Warning("mark node dirty after update failed:", dErr)
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+			return err
+		}
+		return s.MarkNodeDirtyTx(tx, id)
+	}); err != nil {
+		return err
 	}
 	if mgr := runtime.GetManager(); mgr != nil {
 		mgr.InvalidateNode(id)
@@ -588,6 +672,53 @@ func (s *NodeService) NodeFromRequestForCertificate(req *NodeMutationRequest) (*
 		return nil, err
 	}
 	return n, nil
+}
+
+// MigrateNodeTokensToActiveKey uses compare-and-swap to avoid clobbering live
+// changes. Current-key rows are skipped; changed and skipped counts are returned.
+func (s *NodeService) MigrateNodeTokensToActiveKey() (int, int, error) {
+	codec := nodetoken.Active()
+	if !codec.Enabled() {
+		return 0, 0, errors.New("node-token encryption is off; set NODE_TOKEN_ENCRYPTION=migration|required and a key first")
+	}
+	db := database.GetDB()
+	var nodes []*model.Node
+	if err := db.Model(model.Node{}).Order("id asc").Find(&nodes).Error; err != nil {
+		return 0, 0, err
+	}
+	changed, skipped := 0, 0
+	for _, n := range nodes {
+		old := n.ApiToken
+		if old == "" {
+			skipped++
+			continue
+		}
+		if codec.EncryptedWithActive(old) {
+			if _, err := codec.Decrypt(n.Id, old); err != nil {
+				return changed, skipped, fmt.Errorf("node %d validate active ciphertext: %w", n.Id, err)
+			}
+			skipped++
+			continue
+		}
+		plain, err := codec.Decrypt(n.Id, old) // plaintext passes through; old-key ciphertext is decrypted
+		if err != nil {
+			return changed, skipped, fmt.Errorf("node %d decrypt: %w", n.Id, err)
+		}
+		enc, err := codec.Encrypt(n.Id, plain)
+		if err != nil {
+			return changed, skipped, fmt.Errorf("node %d encrypt: %w", n.Id, err)
+		}
+		res := db.Model(model.Node{}).Where("id = ? AND api_token = ?", n.Id, old).Update("api_token", enc)
+		if res.Error != nil {
+			return changed, skipped, res.Error
+		}
+		if res.RowsAffected == 1 {
+			changed++
+		} else {
+			skipped++ // raced with a live update; a later run handles it
+		}
+	}
+	return changed, skipped, nil
 }
 
 func (s *NodeService) GetRemoteInboundOptions(ctx context.Context, n *model.Node) ([]runtime.RemoteInboundOption, error) {
@@ -652,9 +783,9 @@ func (s *NodeService) EnsureInboundTagAllowedTx(tx *gorm.DB, nodeID int, tag str
 		Updates(map[string]any{"inbound_tags": string(buf)}).Error
 }
 
-func FilterNodeSnapshot(n *model.Node, snap *runtime.TrafficSnapshot) {
-	if n == nil || snap == nil || n.InboundSyncMode != "selected" {
-		return
+func nodeSelectedTagSet(n *model.Node) map[string]struct{} {
+	if n == nil || n.InboundSyncMode != "selected" {
+		return nil
 	}
 	prefix := nodeTagPrefix(&n.Id)
 	allowed := make(map[string]struct{}, len(n.InboundTags)*2)
@@ -667,6 +798,30 @@ func FilterNodeSnapshot(n *model.Node, snap *runtime.TrafficSnapshot) {
 				allowed[prefix+tag] = struct{}{}
 			}
 		}
+	}
+	return allowed
+}
+
+// A deselected tag is still served by the node — FilterNodeSnapshot just stops
+// reporting it — so its absence must never be read as "the node deleted it".
+func unmanagedTagPredicate(n *model.Node) func(string) bool {
+	managed := nodeSelectedTagSet(n)
+	if managed == nil {
+		return func(string) bool { return false }
+	}
+	return func(tag string) bool {
+		_, ok := managed[tag]
+		return !ok
+	}
+}
+
+func FilterNodeSnapshot(n *model.Node, snap *runtime.TrafficSnapshot) {
+	if n == nil || snap == nil || n.InboundSyncMode != "selected" {
+		return
+	}
+	allowed := nodeSelectedTagSet(n)
+	for _, tag := range snap.ManagedAliases {
+		allowed[tag] = struct{}{}
 	}
 	filtered := make([]*model.Inbound, 0, len(snap.Inbounds))
 	for _, inbound := range snap.Inbounds {
@@ -710,6 +865,9 @@ func (s *NodeService) Delete(id int) error {
 		if err := tx.Where("node_id = ?", id).Delete(&model.NodeClientTraffic{}).Error; err != nil {
 			return err
 		}
+		if err := tx.Where("node_id = ?", id).Delete(&model.NodePendingReset{}).Error; err != nil {
+			return err
+		}
 		guids := []string{synthNodeGuid(id)}
 		if guid != "" {
 			guids = append(guids, guid)
@@ -724,8 +882,9 @@ func (s *NodeService) Delete(id int) error {
 	if mgr := runtime.GetManager(); mgr != nil {
 		mgr.InvalidateNode(id)
 	}
-	nodeMetrics.drop(nodeMetricKey(id, "cpu"))
-	nodeMetrics.drop(nodeMetricKey(id, "mem"))
+	for _, metric := range NodeMetricKeys {
+		nodeMetrics.drop(nodeMetricKey(id, metric))
+	}
 	return nil
 }
 
@@ -781,12 +940,11 @@ func (s *NodeService) UpdatePanels(ids []int, dev bool) ([]NodeUpdateResult, err
 	if mgr == nil {
 		return nil, fmt.Errorf("runtime manager unavailable")
 	}
-	results := make([]NodeUpdateResult, 0, len(ids))
-	for _, id := range ids {
+	results, panics := fanoutInboundResults(ids, nodeFanoutConcurrency, func(i int) NodeUpdateResult {
+		id := ids[i]
 		n, err := s.GetById(id)
 		if err != nil || n == nil {
-			results = append(results, NodeUpdateResult{Id: id, OK: false, Error: "node not found"})
-			continue
+			return NodeUpdateResult{Id: id, OK: false, Error: "node not found"}
 		}
 		res := NodeUpdateResult{Id: id, Name: n.Name}
 		switch {
@@ -809,27 +967,39 @@ func (s *NodeService) UpdatePanels(ids []int, dev bool) ([]NodeUpdateResult, err
 				res.OK = true
 			}
 		}
-		results = append(results, res)
+		return res
+	})
+	for i, panicErr := range panics {
+		if panicErr != nil {
+			results[i] = NodeUpdateResult{Id: ids[i], Error: panicErr.Error()}
+		}
 	}
 	return results, nil
 }
 
 func (s *NodeService) UpdateHeartbeat(id int, p HeartbeatPatch) error {
 	db := database.GetDB()
+	// Map updates bypass GORM field serializers. Encode the availability list
+	// explicitly so it survives list requests and panel restarts.
+	unavailable, err := json.Marshal(p.UnavailableMetrics)
+	if err != nil {
+		return err
+	}
 	updates := map[string]any{
-		"status":         p.Status,
-		"last_heartbeat": p.LastHeartbeat,
-		"latency_ms":     p.LatencyMs,
-		"xray_version":   p.XrayVersion,
-		"panel_version":  p.PanelVersion,
-		"cpu_pct":        p.CpuPct,
-		"mem_pct":        p.MemPct,
-		"uptime_secs":    p.UptimeSecs,
-		"net_up":         p.NetUp,
-		"net_down":       p.NetDown,
-		"last_error":     p.LastError,
-		"xray_state":     p.XrayState,
-		"xray_error":     p.XrayError,
+		"unavailable_metrics": string(unavailable),
+		"status":              p.Status,
+		"last_heartbeat":      p.LastHeartbeat,
+		"latency_ms":          p.LatencyMs,
+		"xray_version":        p.XrayVersion,
+		"panel_version":       p.PanelVersion,
+		"cpu_pct":             p.CpuPct,
+		"mem_pct":             p.MemPct,
+		"uptime_secs":         p.UptimeSecs,
+		"net_up":              p.NetUp,
+		"net_down":            p.NetDown,
+		"last_error":          p.LastError,
+		"xray_state":          p.XrayState,
+		"xray_error":          p.XrayError,
 	}
 	// Only learn the GUID; never clear a known one if an old-build node (or a
 	// failed probe) reports none, so the stable identity survives blips.
@@ -842,7 +1012,9 @@ func (s *NodeService) UpdateHeartbeat(id int, p HeartbeatPatch) error {
 	}
 	if p.Status == "online" {
 		now := time.Unix(p.LastHeartbeat, 0)
-		nodeMetrics.append(nodeMetricKey(id, "cpu"), now, p.CpuPct)
+		if !slices.Contains(p.UnavailableMetrics, "cpu") {
+			nodeMetrics.append(nodeMetricKey(id, "cpu"), now, p.CpuPct)
+		}
 		nodeMetrics.append(nodeMetricKey(id, "mem"), now, p.MemPct)
 		nodeMetrics.append(nodeMetricKey(id, "netUp"), now, float64(p.NetUp))
 		nodeMetrics.append(nodeMetricKey(id, "netDown"), now, float64(p.NetDown))
@@ -900,6 +1072,12 @@ func (s *NodeService) ClearNodeDirty(id int, dirtyAt int64) error {
 	return database.GetDB().Model(model.Node{}).
 		Where("id = ? AND config_dirty_at = ?", id, dirtyAt).
 		Update("config_dirty", false).Error
+}
+
+func (s *NodeService) SetDownNotified(id int, notified bool) error {
+	return database.GetDB().Model(model.Node{}).
+		Where("id = ?", id).
+		Update("down_notified", notified).Error
 }
 
 func (s *NodeService) MarkNodeInboundsAdopted(id int) error {
@@ -983,27 +1161,46 @@ func (s *NodeService) ProbeWithOutbound(ctx context.Context, n *model.Node, outb
 // Xray isn't running or the bridge can't be built, fn runs with an empty
 // proxyURL so callers fall back to a direct connection.
 func (s *NodeService) withOutboundBridge(nodeID int, outboundTag string, fn func(proxyURL string)) {
-	proc := XrayProcess()
-	if proc == nil || !proc.IsRunning() {
+	bridge := openOutboundBridge(nodeID, outboundTag)
+	if bridge == nil {
 		fn("")
 		return
 	}
+	defer bridge.close()
+	fn(bridge.proxyURL)
+}
+
+// outboundBridge is one withOutboundBridge call's temporary inbound and leading
+// routing rule, tied to the core process it was built in.
+type outboundBridge struct {
+	proc       *xray.Process
+	api        xray.XrayAPI
+	inboundTag string
+	proxyURL   string
+}
+
+// openOutboundBridge holds the package lock, like every change to the running
+// core, but not while the probe runs; nil means Xray is down or the build failed.
+func openOutboundBridge(nodeID int, outboundTag string) *outboundBridge {
+	lock.Lock()
+	defer lock.Unlock()
+	proc := XrayProcess()
+	if proc == nil || !proc.IsRunning() {
+		return nil
+	}
 	apiPort := proc.GetAPIPort()
 	if apiPort <= 0 {
-		fn("")
-		return
+		return nil
 	}
 
 	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
-		fn("")
-		return
+		return nil
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	listener.Close()
 
 	tag := fmt.Sprintf("node-test-%d-%d", nodeID, time.Now().UnixNano())
-	proxyURL := fmt.Sprintf("socks5://127.0.0.1:%d", port)
 
 	inboundJSON, err := json.Marshal(xray.InboundConfig{
 		Listen:   json_util.RawMessage(`"127.0.0.1"`),
@@ -1013,8 +1210,7 @@ func (s *NodeService) withOutboundBridge(nodeID int, outboundTag string, fn func
 		Tag:      tag,
 	})
 	if err != nil {
-		fn("")
-		return
+		return nil
 	}
 
 	cfg := proc.GetConfig()
@@ -1035,44 +1231,56 @@ func (s *NodeService) withOutboundBridge(nodeID int, outboundTag string, fn func
 	routing["rules"] = append([]any{rule}, rules...)
 	routingJSON, err := json.Marshal(routing)
 	if err != nil {
-		fn("")
-		return
+		return nil
 	}
-	originalRoutingJSON := cfg.RouterConfig
 
-	api := xray.XrayAPI{}
-	if err := api.Init(apiPort); err != nil {
-		fn("")
-		return
+	bridge := &outboundBridge{proc: proc, inboundTag: tag, proxyURL: fmt.Sprintf("socks5://127.0.0.1:%d", port)}
+	if err := bridge.api.Init(apiPort); err != nil {
+		return nil
 	}
-	defer api.Close()
-
-	if err := api.AddInbound(inboundJSON); err != nil {
-		fn("")
-		return
+	if err := bridge.api.AddInbound(inboundJSON); err != nil {
+		bridge.api.Close()
+		return nil
 	}
-	defer func() {
-		if err := api.DelInbound(tag); err != nil {
-			logger.Warning("remove temp node bridge inbound failed:", err)
-		}
-	}()
-
-	if err := api.ApplyRoutingConfig(routingJSON); err != nil {
-		fn("")
-		return
+	if err := bridge.api.ApplyRoutingConfig(routingJSON); err != nil {
+		bridge.removeInbound()
+		bridge.api.Close()
+		return nil
 	}
-	defer func() {
-		restore := originalRoutingJSON
-		if len(restore) == 0 {
-			restore = []byte("{}")
-		}
-		if err := api.ApplyRoutingConfig(restore); err != nil {
-			logger.Warning("restore routing after node bridge failed:", err)
-		}
-	}()
-
-	fn(proxyURL)
+	balancerOverrides.reapply(proc, &bridge.api, cfg)
+	return bridge
 }
+
+// close restores the routing the core's config holds now, which a save during the
+// probe may have changed. A core restarted meanwhile never had the bridge.
+func (b *outboundBridge) close() {
+	defer b.api.Close()
+	lock.Lock()
+	defer lock.Unlock()
+	if XrayProcess() != b.proc {
+		return
+	}
+	cfg := b.proc.GetConfig()
+	restore := cfg.RouterConfig
+	if len(restore) == 0 {
+		restore = []byte("{}")
+	}
+	if err := b.api.ApplyRoutingConfig(restore); err != nil {
+		logger.Warning("restore routing after node bridge failed:", err)
+	}
+	balancerOverrides.reapply(b.proc, &b.api, cfg)
+	b.removeInbound()
+}
+
+func (b *outboundBridge) removeInbound() {
+	if err := b.api.DelInbound(b.inboundTag); err != nil {
+		logger.Warning("remove temp node bridge inbound failed:", err)
+	}
+}
+
+// A status envelope holds a handful of scalars; the cap keeps a hostile or
+// broken node from dictating the master's allocation on every heartbeat.
+const maxProbeBodyBytes = 1 << 20 // 1 MiB
 
 func (s *NodeService) probe(ctx context.Context, n *model.Node, proxyURL string) (HeartbeatPatch, error) {
 	patch := HeartbeatPatch{LastHeartbeat: time.Now().Unix()}
@@ -1104,7 +1312,12 @@ func (s *NodeService) probe(ctx context.Context, n *model.Node, proxyURL string)
 		return patch, err
 	}
 	if n.ApiToken != "" {
-		req.Header.Set("Authorization", "Bearer "+n.ApiToken)
+		token, derr := nodetoken.Decrypt(n.Id, n.ApiToken)
+		if derr != nil {
+			patch.LastError = derr.Error()
+			return patch, derr
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	req.Header.Set("Accept", "application/json")
 
@@ -1132,8 +1345,9 @@ func (s *NodeService) probe(ctx context.Context, n *model.Node, proxyURL string)
 		Success bool   `json:"success"`
 		Msg     string `json:"msg"`
 		Obj     *struct {
-			CpuPct float64 `json:"cpu"`
-			Mem    struct {
+			CpuPct             float64  `json:"cpu"`
+			UnavailableMetrics []string `json:"unavailableMetrics"`
+			Mem                struct {
 				Current uint64 `json:"current"`
 				Total   uint64 `json:"total"`
 			} `json:"mem"`
@@ -1151,16 +1365,23 @@ func (s *NodeService) probe(ctx context.Context, n *model.Node, proxyURL string)
 			} `json:"netIO"`
 		} `json:"obj"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxProbeBodyBytes)).Decode(&envelope); err != nil {
 		patch.LastError = "decode response: " + err.Error()
 		return patch, err
 	}
-	if !envelope.Success || envelope.Obj == nil {
+	if !envelope.Success {
 		patch.LastError = "remote returned success=false: " + envelope.Msg
+		return patch, errors.New(patch.LastError)
+	}
+	// A panel that has not sampled its status yet answers success with a null
+	// obj; saying so beats "success=false: " with nothing after the colon.
+	if envelope.Obj == nil {
+		patch.LastError = "remote panel reported no status yet; it may still be starting up"
 		return patch, errors.New(patch.LastError)
 	}
 	o := envelope.Obj
 	patch.CpuPct = o.CpuPct
+	patch.UnavailableMetrics = o.UnavailableMetrics
 	if o.Mem.Total > 0 {
 		patch.MemPct = float64(o.Mem.Current) * 100.0 / float64(o.Mem.Total)
 	}
@@ -1176,14 +1397,15 @@ func (s *NodeService) probe(ctx context.Context, n *model.Node, proxyURL string)
 }
 
 type ProbeResultUI struct {
-	Status       string  `json:"status" example:"online"`
-	LatencyMs    int     `json:"latencyMs" example:"42"`
-	XrayVersion  string  `json:"xrayVersion" example:"25.10.31"`
-	PanelVersion string  `json:"panelVersion" example:"v3.x.x"`
-	CpuPct       float64 `json:"cpuPct" example:"12.5"`
-	MemPct       float64 `json:"memPct" example:"45.2"`
-	UptimeSecs   uint64  `json:"uptimeSecs" example:"86400"`
-	Error        string  `json:"error"`
+	Status             string   `json:"status" example:"online"`
+	LatencyMs          int      `json:"latencyMs" example:"42"`
+	XrayVersion        string   `json:"xrayVersion" example:"25.10.31"`
+	PanelVersion       string   `json:"panelVersion" example:"v3.x.x"`
+	CpuPct             float64  `json:"cpuPct" example:"12.5"`
+	MemPct             float64  `json:"memPct" example:"45.2"`
+	UptimeSecs         uint64   `json:"uptimeSecs" example:"86400"`
+	UnavailableMetrics []string `json:"unavailableMetrics,omitempty"`
+	Error              string   `json:"error"`
 	// XrayState/XrayError are populated on successful probes even when the node's
 	// Xray core is not healthy. The UI uses them for a distinct "panel ok, xray failed" indicator.
 	XrayState string `json:"xrayState"`
@@ -1192,15 +1414,16 @@ type ProbeResultUI struct {
 
 func (p HeartbeatPatch) ToUI(ok bool) ProbeResultUI {
 	r := ProbeResultUI{
-		LatencyMs:    p.LatencyMs,
-		XrayVersion:  p.XrayVersion,
-		PanelVersion: p.PanelVersion,
-		CpuPct:       p.CpuPct,
-		MemPct:       p.MemPct,
-		UptimeSecs:   p.UptimeSecs,
-		Error:        FriendlyProbeError(p.LastError),
-		XrayState:    p.XrayState,
-		XrayError:    p.XrayError,
+		LatencyMs:          p.LatencyMs,
+		XrayVersion:        p.XrayVersion,
+		PanelVersion:       p.PanelVersion,
+		CpuPct:             p.CpuPct,
+		MemPct:             p.MemPct,
+		UptimeSecs:         p.UptimeSecs,
+		UnavailableMetrics: p.UnavailableMetrics,
+		Error:              FriendlyProbeError(p.LastError),
+		XrayState:          p.XrayState,
+		XrayError:          p.XrayError,
 	}
 	if ok {
 		r.Status = "online"

@@ -2,7 +2,8 @@
 .idea/
 .vscode/
 .cursor/
-.claude/*
+.specify/
+.claude/
 .cache/
 .sync*
 
@@ -18,14 +19,12 @@ backup/
 bin/
 x-ui/
 dist/
-!internal/web/dist/
-internal/web/dist/*
-!internal/web/dist/.gitkeep
 release/
 node_modules/
 
 # Ignore compiled binaries
 main
+3x-ui
 
 # Ignore OS specific files
 .DS_Store
@@ -33,6 +32,7 @@ Thumbs.db
 
 # Ignore Go build files
 *.exe
+*.syso
 x-ui.db
 x-ui.db-shm
 x-ui.db-wal

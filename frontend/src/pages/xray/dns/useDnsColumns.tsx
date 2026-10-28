@@ -4,6 +4,8 @@ import { Button, Dropdown, Input, InputNumber, Space } from 'antd';
 import { MoreOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
+import { onNumber } from '@/utils/onNumber';
+
 import { addrFor, domainsFor, expectedIPsFor } from './helpers';
 import type { DnsServerValue } from './DnsServerModal';
 
@@ -32,12 +34,34 @@ export function useDnsServerColumns({
               trigger={['click']}
               menu={{
                 items: [
-                  { key: 'edit', label: <><EditOutlined /> {t('edit')}</>, onClick: () => openEditServer(index) },
-                  { key: 'del', danger: true, label: <><DeleteOutlined /> {t('delete')}</>, onClick: () => deleteServer(index) },
+                  {
+                    key: 'edit',
+                    label: (
+                      <>
+                        <EditOutlined aria-hidden /> {t('edit')}
+                      </>
+                    ),
+                    onClick: () => openEditServer(index),
+                  },
+                  {
+                    key: 'del',
+                    danger: true,
+                    label: (
+                      <>
+                        <DeleteOutlined aria-hidden /> {t('delete')}
+                      </>
+                    ),
+                    onClick: () => deleteServer(index),
+                  },
                 ],
               }}
             >
-              <Button aria-label={t('more')} shape="circle" size="small" icon={<MoreOutlined />} />
+              <Button
+                aria-label={t('more')}
+                shape="circle"
+                size="small"
+                icon={<MoreOutlined aria-hidden />}
+              />
             </Dropdown>
           </Space>
         ),
@@ -83,7 +107,14 @@ export function useFakednsColumns({
         render: (_v, _record, index) => (
           <Space size={6}>
             <span className="row-index">{index + 1}</span>
-            <Button aria-label={t('delete')} shape="circle" size="small" danger icon={<DeleteOutlined />} onClick={() => deleteFakedns(index)} />
+            <Button
+              aria-label={t('delete')}
+              shape="circle"
+              size="small"
+              danger
+              icon={<DeleteOutlined aria-hidden />}
+              onClick={() => deleteFakedns(index)}
+            />
           </Space>
         ),
       },
@@ -113,7 +144,7 @@ export function useFakednsColumns({
             aria-label={t('pages.xray.fakedns.poolSize')}
             min={1}
             size="small"
-            onChange={(v) => updateFakednsField(index, 'poolSize', Number(v) || 0)}
+            onChange={onNumber((v) => updateFakednsField(index, 'poolSize', v))}
           />
         ),
       },

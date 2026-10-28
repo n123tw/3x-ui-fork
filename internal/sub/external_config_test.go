@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goccy/go-json"
 
@@ -98,6 +99,31 @@ func TestExpandEntryLinkAppliesRemark(t *testing.T) {
 	}
 }
 
+func TestExpandEntrySubscriptionAppliesNamePrefix(t *testing.T) {
+	const subURL = "https://provider.example/sub-prefix"
+	subscriptionCache.Lock()
+	subscriptionCache.m[subURL] = subscriptionCacheEntry{
+		links:     []string{"trojan://pw@b.com:8443#HK-01"},
+		fetchedAt: time.Now(),
+	}
+	subscriptionCache.Unlock()
+	t.Cleanup(func() {
+		subscriptionCache.Lock()
+		delete(subscriptionCache.m, subURL)
+		subscriptionCache.Unlock()
+	})
+
+	got := expandEntry(externalLinkEntry{
+		Kind:       model.ExternalLinkKindSubscription,
+		Value:      subURL,
+		NamePrefix: "[zjh] ",
+		Email:      "zjh",
+	})
+	if len(got) != 1 || got[0].Name != "[zjh] HK-01" {
+		t.Fatalf("expandEntry = %#v", got)
+	}
+}
+
 func TestExpandEntryLinkFallsBackToOriginalName(t *testing.T) {
 	got := expandEntry(externalLinkEntry{Kind: model.ExternalLinkKindLink, Value: "trojan://pw@b.com:8443#orig", Remark: ""})
 	if len(got) != 1 || got[0].Name != "orig" {
@@ -129,7 +155,7 @@ func TestLinkDisplayName(t *testing.T) {
 
 func TestClashProxyFromExternalTrojanReality(t *testing.T) {
 	link := "trojan://provider-pass@37.27.201.56:8443?type=tcp&security=reality&sni=aws.amazon.com&pbk=PBK&sid=298b44&fp=chrome#srv"
-	svc := NewSubClashService(false, "", NewSubService(""))
+	svc := NewSubClashService(false, "", false, NewSubService(""))
 	proxy := svc.clashProxyFromExternal(link, "DE-Provider")
 	if proxy == nil {
 		t.Fatal("expected a clash proxy, got nil")

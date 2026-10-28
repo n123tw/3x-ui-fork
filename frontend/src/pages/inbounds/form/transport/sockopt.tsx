@@ -1,3 +1,4 @@
+import { useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Alert, Form, InputNumber, Segmented, Select, Switch } from 'antd';
 import { Controller, useFormContext, useWatch } from 'react-hook-form';
@@ -28,6 +29,7 @@ export default function SockoptForm({
   network: string;
 }) {
   const { t } = useTranslation();
+  const uid = useId();
   const { control, getValues, setValue } = useFormContext();
   const sock = useWatch({ control, name: 'streamSettings.sockopt' });
   const on = !!sock && typeof sock === 'object' && Object.keys(sock).length > 0;
@@ -37,7 +39,9 @@ export default function SockoptForm({
   const sockTrusted = useWatch({ control, name: 'streamSettings.sockopt.trustedXForwardedFor' });
   const transportAcceptPP = useWatch({
     control,
-    name: transportField ? `streamSettings.${transportField}.acceptProxyProtocol` : 'streamSettings.__noTransportProxyField',
+    name: transportField
+      ? `streamSettings.${transportField}.acceptProxyProtocol`
+      : 'streamSettings.__noTransportProxyField',
   });
 
   /* Presets write the same sockopt fields the user could set by hand below,
@@ -99,14 +103,22 @@ export default function SockoptForm({
             tooltip={t('pages.inbounds.form.realClientIpHint')}
           >
             <Segmented
+              aria-label={t('pages.inbounds.form.realClientIp')}
+              aria-describedby={`${uid}-real-client-ip-hint`}
               value={presetValue}
               onChange={(v) => applyRealClientIpPreset(v as RealClientIpPreset)}
               options={[
                 { value: 'off', label: t('pages.inbounds.form.realClientIpPresetOff') },
-                { value: 'cloudflare', label: t('pages.inbounds.form.realClientIpPresetCloudflare') },
+                {
+                  value: 'cloudflare',
+                  label: t('pages.inbounds.form.realClientIpPresetCloudflare'),
+                },
                 { value: 'proxy', label: t('pages.inbounds.form.realClientIpPresetProxyProtocol') },
               ]}
             />
+            <span id={`${uid}-real-client-ip-hint`} hidden>
+              {t('pages.inbounds.form.realClientIpHint')}
+            </span>
           </Form.Item>
           {trustedMismatch && (
             <Alert
@@ -124,7 +136,10 @@ export default function SockoptForm({
               title={t('pages.inbounds.form.realClientIpProxyProtocolTransportWarn')}
             />
           )}
-          <FormField name={['streamSettings', 'sockopt', 'mark']} label={t('pages.inbounds.form.routeMark')}>
+          <FormField
+            name={['streamSettings', 'sockopt', 'mark']}
+            label={t('pages.inbounds.form.routeMark')}
+          >
             <InputNumber min={0} />
           </FormField>
           <FormField
@@ -139,7 +154,10 @@ export default function SockoptForm({
           >
             <InputNumber min={0} />
           </FormField>
-          <FormField name={['streamSettings', 'sockopt', 'tcpMaxSeg']} label={t('pages.inbounds.form.tcpMaxSeg')}>
+          <FormField
+            name={['streamSettings', 'sockopt', 'tcpMaxSeg']}
+            label={t('pages.inbounds.form.tcpMaxSeg')}
+          >
             <InputNumber min={0} />
           </FormField>
           <FormField

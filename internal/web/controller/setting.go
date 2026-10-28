@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
@@ -11,6 +12,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/web/entity"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/middleware"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
+	"github.com/mhsanaei/3x-ui/v3/internal/web/service/discord"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service/email"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service/panel"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/session"
@@ -33,10 +35,11 @@ type updateUserForm struct {
 // "unchanged", so clearing needs its own signal — see #5724).
 type updateSettingForm struct {
 	entity.AllSetting
-	TwoFactorCode     string `json:"twoFactorCode" form:"twoFactorCode"`
-	ClearTgBotToken   bool   `json:"clearTgBotToken" form:"clearTgBotToken"`
-	ClearLdapPassword bool   `json:"clearLdapPassword" form:"clearLdapPassword"`
-	ClearSmtpPassword bool   `json:"clearSmtpPassword" form:"clearSmtpPassword"`
+	TwoFactorCode        string `json:"twoFactorCode" form:"twoFactorCode"`
+	ClearTgBotToken      bool   `json:"clearTgBotToken" form:"clearTgBotToken"`
+	ClearLdapPassword    bool   `json:"clearLdapPassword" form:"clearLdapPassword"`
+	ClearSmtpPassword    bool   `json:"clearSmtpPassword" form:"clearSmtpPassword"`
+	ClearDiscordBotToken bool   `json:"clearDiscordBotToken" form:"clearDiscordBotToken"`
 }
 
 type validateRegexForm struct {
@@ -65,6 +68,7 @@ func (a *SettingController) initRouter(g *gin.RouterGroup) {
 
 	g.POST("/all", a.getAllSetting)
 	g.POST("/defaultSettings", a.getDefaultSettings)
+	g.POST("/factoryDefaults", a.getFactoryDefaults)
 	g.POST("/update", a.updateSetting)
 	g.POST("/validateRegex", a.validateRegex)
 	g.POST("/updateUser", a.updateUser)
@@ -76,6 +80,8 @@ func (a *SettingController) initRouter(g *gin.RouterGroup) {
 	g.POST("/apiTokens/setEnabled/:id", a.setApiTokenEnabled)
 	g.POST("/testSmtp", a.testSmtp)
 	g.POST("/testTgBot", a.testTgBot)
+	g.POST("/tgBotCapabilities", a.tgBotCapabilities)
+	g.POST("/testDiscord", a.testDiscord)
 }
 
 func (a *SettingController) validateRegex(c *gin.Context) {
@@ -112,6 +118,10 @@ func (a *SettingController) getDefaultSettings(c *gin.Context) {
 	jsonObj(c, result, nil)
 }
 
+func (a *SettingController) getFactoryDefaults(c *gin.Context) {
+	jsonObj(c, a.settingService.GetFactoryDefaults(), nil)
+}
+
 // updateSetting updates all settings with the provided data.
 func (a *SettingController) updateSetting(c *gin.Context) {
 	form, ok := middleware.BindAndValidate[updateSettingForm](c)
@@ -125,16 +135,27 @@ func (a *SettingController) updateSetting(c *gin.Context) {
 	oldTgToken, _ := a.settingService.GetTgBotToken()
 	oldTgChatId, _ := a.settingService.GetTgBotChatId()
 	oldTgAPIServer, _ := a.settingService.GetTgBotAPIServer()
-	if twoFactorErr == nil && oldTwoFactor && !allSetting.TwoFactorEnable {
-		if err := a.settingService.VerifyTwoFactorCode(form.TwoFactorCode); err != nil {
-			jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
-			return
+	oldDiscordEnable, _ := a.settingService.GetDiscordBotEnable()
+	oldDiscordToken, _ := a.settingService.GetDiscordBotToken()
+	oldDiscordChannelId, _ := a.settingService.GetDiscordChannelId()
+	oldDiscordRunTime, _ := a.settingService.GetDiscordRunTime()
+	if twoFactorErr == nil && oldTwoFactor {
+		// Rebinding the authenticator is the same class of change as turning 2FA
+		// off, so both need a current code. Blank still means "unchanged".
+		submittedToken := strings.TrimSpace(allSetting.TwoFactorToken)
+		storedToken, _ := a.settingService.GetTwoFactorToken()
+		if !allSetting.TwoFactorEnable || (submittedToken != "" && submittedToken != storedToken) {
+			if err := a.settingService.VerifyTwoFactorCode(form.TwoFactorCode); err != nil {
+				jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
+				return
+			}
 		}
 	}
 	err := a.settingService.UpdateAllSetting(allSetting, service.SecretClears{
-		TgBotToken:   form.ClearTgBotToken,
-		LdapPassword: form.ClearLdapPassword,
-		SmtpPassword: form.ClearSmtpPassword,
+		TgBotToken:      form.ClearTgBotToken,
+		LdapPassword:    form.ClearLdapPassword,
+		SmtpPassword:    form.ClearSmtpPassword,
+		DiscordBotToken: form.ClearDiscordBotToken,
 	})
 	if err == nil && twoFactorErr == nil && !oldTwoFactor && allSetting.TwoFactorEnable {
 		if bumpErr := a.userService.BumpLoginEpoch(); bumpErr != nil {
@@ -157,6 +178,15 @@ func (a *SettingController) updateSetting(c *gin.Context) {
 				oldTgAPIServer != allSetting.TgBotAPIServer))
 		if tgChanged {
 			reloadTgbotFunc()
+		}
+	}
+	if err == nil && reloadDiscordFunc != nil {
+		discordChanged := oldDiscordEnable != allSetting.DiscordBotEnable ||
+			oldDiscordRunTime != allSetting.DiscordRunTime ||
+			(allSetting.DiscordBotEnable && (oldDiscordToken != allSetting.DiscordBotToken ||
+				oldDiscordChannelId != allSetting.DiscordChannelId))
+		if discordChanged {
+			reloadDiscordFunc()
 		}
 	}
 	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
@@ -211,11 +241,18 @@ func (a *SettingController) getDefaultXrayConfig(c *gin.Context) {
 }
 
 type apiTokenCreateForm struct {
-	Name string `json:"name" form:"name"`
+	Name      string `json:"name" form:"name"`
+	Scope     string `json:"scope" form:"scope"`
+	ExpiresAt int64  `json:"expiresAt" form:"expiresAt"`
 }
 
 type apiTokenEnabledForm struct {
-	Enabled bool `json:"enabled" form:"enabled"`
+	Enabled       bool   `json:"enabled" form:"enabled"`
+	ExpectedScope string `json:"expectedScope" form:"expectedScope"`
+}
+
+type apiTokenScopeForm struct {
+	ExpectedScope string `json:"expectedScope" form:"expectedScope"`
 }
 
 func (a *SettingController) listApiTokens(c *gin.Context) {
@@ -233,7 +270,7 @@ func (a *SettingController) createApiToken(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 		return
 	}
-	row, err := a.apiTokenService.Create(form.Name)
+	row, err := a.apiTokenService.Create(form.Name, form.Scope, form.ExpiresAt)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 		return
@@ -247,7 +284,12 @@ func (a *SettingController) deleteApiToken(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 		return
 	}
-	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.apiTokenService.Delete(id))
+	form := &apiTokenScopeForm{}
+	if bindErr := c.ShouldBind(form); bindErr != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), bindErr)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.apiTokenService.DeleteExpectedScope(id, form.ExpectedScope))
 }
 
 func (a *SettingController) setApiTokenEnabled(c *gin.Context) {
@@ -261,7 +303,7 @@ func (a *SettingController) setApiTokenEnabled(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), bindErr)
 		return
 	}
-	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.apiTokenService.SetEnabled(id, form.Enabled))
+	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), a.apiTokenService.SetEnabledExpectedScope(id, form.ExpectedScope, form.Enabled))
 }
 
 func (a *SettingController) testSmtp(c *gin.Context) {
@@ -307,6 +349,42 @@ func (a *SettingController) testTgBot(c *gin.Context) {
 	jsonMsg(c, I18nWeb(c, "pages.settings.tgBotNotRunning"), errors.New("bot not started"))
 }
 
+// tgBotCapabilities reports what the bot can do. Inline mode is a BotFather
+// switch the API can read but never set, so the panel warns when lists can't open.
+func (a *SettingController) tgBotCapabilities(c *gin.Context) {
+	enabled, err := a.settingService.GetTgbotEnabled()
+	if err != nil || !enabled {
+		jsonMsg(c, I18nWeb(c, "pages.settings.tgBotNotEnabled"), errors.New("telegram bot disabled"))
+		return
+	}
+	if tgCapsFunc == nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.tgBotNotRunning"), errors.New("bot not started"))
+		return
+	}
+	caps, err := tgCapsFunc()
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.tgTestFailed")+": "+err.Error(), err)
+		return
+	}
+	jsonObj(c, caps, nil)
+}
+
+// TgBotCapabilities is the browser-safe shape of the bot's own capabilities.
+type TgBotCapabilities struct {
+	InlineEnabled bool `json:"inlineEnabled" example:"true"`
+	// GroupPrivacy off means the bot reads every group message; when it is on,
+	// a bare /start in a group is invisible to the bot.
+	GroupPrivacy bool   `json:"groupPrivacy" example:"false"`
+	Username     string `json:"username" example:"xui_bot"`
+	Running      bool   `json:"running" example:"true"`
+}
+
+// tgCapsFunc is wired from the web layer; importing tgbot here is circular.
+var tgCapsFunc func() (TgBotCapabilities, error)
+
+// SetTgBotCapsFunc registers the capability probe.
+func SetTgBotCapsFunc(fn func() (TgBotCapabilities, error)) { tgCapsFunc = fn }
+
 // testTgFunc is set from web layer to test Telegram sending without circular imports.
 var testTgFunc func() error
 
@@ -323,3 +401,31 @@ var emailService *email.EmailService
 
 // SetEmailService registers the email service for test endpoints.
 func SetEmailService(s *email.EmailService) { emailService = s }
+
+// reloadDiscordFunc is wired from the web layer to reschedule or cancel Discord notify job.
+var reloadDiscordFunc func()
+
+func SetReloadDiscordFunc(fn func()) { reloadDiscordFunc = fn }
+
+// discordService is set from web layer.
+var discordService *discord.DiscordService
+
+// SetDiscordService registers the Discord service for test endpoints.
+func SetDiscordService(s *discord.DiscordService) { discordService = s }
+
+func (a *SettingController) testDiscord(c *gin.Context) {
+	if discordService == nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.discordNotInitialized"), errors.New("discord service not available"))
+		return
+	}
+	enabled, err := a.settingService.GetDiscordBotEnable()
+	if err != nil || !enabled {
+		jsonMsg(c, I18nWeb(c, "pages.settings.discordBotNotEnabled"), errors.New("discord bot disabled"))
+		return
+	}
+	if err := discordService.SendTest(c.Request.Context()); err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.discordTestFailed")+": "+err.Error(), err)
+		return
+	}
+	jsonMsg(c, I18nWeb(c, "pages.settings.discordTestSuccess"), nil)
+}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,13 +22,16 @@ import (
 	wgutil "github.com/mhsanaei/3x-ui/v3/internal/util/wireguard"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
+	"github.com/xtls/xray-core/app/router"
 	routerService "github.com/xtls/xray-core/app/router/command"
 	statsService "github.com/xtls/xray-core/app/stats/command"
 	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
 	hysteriaAccount "github.com/xtls/xray-core/proxy/hysteria/account"
+	"github.com/xtls/xray-core/proxy/masque"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
 	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"github.com/xtls/xray-core/proxy/trojan"
@@ -143,6 +147,7 @@ func (x *XrayAPI) AddInbound(inbound []byte) error {
 		logger.Debug("Failed to unmarshal inbound:", err)
 		return err
 	}
+	localizeNoiseScripts(conf.StreamSetting)
 	config, err := conf.Build()
 	if err != nil {
 		logger.Debug("Failed to build inbound Detur:", err)
@@ -182,8 +187,34 @@ func ValidateOutboundConfig(outbound []byte) error {
 	if err := json.Unmarshal(outbound, detour); err != nil {
 		return err
 	}
-	_, err := detour.Build()
-	return err
+	localizeNoiseScripts(detour.StreamSetting)
+	built, err := detour.Build()
+	if err != nil {
+		return err
+	}
+	return validateWireguardRemoteDNS(built.ProxySettings)
+}
+
+// validateWireguardRemoteDNS refuses what conf.Build() lets through but the core feeds to
+// netip.MustParseAddr at startup: a non-IP remoteDNS entry, like "local" before 26.9.30.
+func validateWireguardRemoteDNS(settings *serial.TypedMessage) error {
+	if settings == nil {
+		return nil
+	}
+	instance, err := settings.GetInstance()
+	if err != nil {
+		return nil
+	}
+	device, ok := instance.(*wireguard.DeviceConfig)
+	if !ok || !device.IsClient {
+		return nil
+	}
+	for _, server := range device.DNS {
+		if _, err := netip.ParseAddr(server); err != nil {
+			return common.NewErrorf("wireguard remoteDNS entry %q is not an IP address", server)
+		}
+	}
+	return nil
 }
 
 // AddOutbound adds a new outbound configuration to the Xray core via gRPC.
@@ -200,6 +231,7 @@ func (x *XrayAPI) AddOutbound(outbound []byte) error {
 		logger.Debug("Failed to unmarshal outbound:", err)
 		return err
 	}
+	localizeNoiseScripts(conf.StreamSetting)
 	config, err := conf.Build()
 	if err != nil {
 		logger.Debug("Failed to build outbound detour:", err)
@@ -236,16 +268,7 @@ func (x *XrayAPI) ApplyRoutingConfig(routing []byte) error {
 		return common.NewError("xray RoutingServiceClient is not initialized")
 	}
 
-	// Rules referencing geoip:/geosite: need the dat files; point xray-core's
-	// in-process loader at the panel's bin folder where they live.
-	ensureXrayAssetLocation()
-
-	routerConf := new(conf.RouterConfig)
-	if err := json.Unmarshal(routing, routerConf); err != nil {
-		logger.Debug("Failed to unmarshal routing config:", err)
-		return err
-	}
-	config, err := routerConf.Build()
+	config, err := buildReloadableRouting(routing)
 	if err != nil {
 		logger.Debug("Failed to build routing config:", err)
 		return err
@@ -259,6 +282,21 @@ func (x *XrayAPI) ApplyRoutingConfig(routing []byte) error {
 		Config:       serial.ToTypedMessage(config),
 	})
 	return err
+}
+
+// buildReloadableRouting builds the rules and balancers RoutingService.AddRule swaps in.
+// The Lua routing script is fixed at core start, so its file is never resolved here.
+func buildReloadableRouting(routing []byte) (*router.Config, error) {
+	// Rules referencing geoip:/geosite: need the dat files; point xray-core's
+	// in-process loader at the panel's bin folder where they live.
+	ensureXrayAssetLocation()
+
+	routerConf := new(conf.RouterConfig)
+	if err := json.Unmarshal(routing, routerConf); err != nil {
+		return nil, err
+	}
+	routerConf.Script = ""
+	return routerConf.Build()
 }
 
 // BalancerInfo is the live state of one balancer inside the running core.
@@ -345,6 +383,10 @@ func (x *XrayAPI) TestRoute(req RouteTestRequest) (*RouteTestResult, error) {
 		return nil, common.NewError("xray RoutingServiceClient is not initialized")
 	}
 
+	if req.Port < 0 || req.Port > math.MaxUint16 {
+		return nil, common.NewErrorf("invalid port: %d", req.Port)
+	}
+
 	network := xnet.Network_TCP
 	if strings.EqualFold(req.Network, "udp") {
 		network = xnet.Network_UDP
@@ -405,6 +447,16 @@ func IsMissingHandlerErr(err error) bool {
 		strings.Contains(msg, "not enough information")
 }
 
+// IsMissingUserErr reports whether err is xray removing a user the inbound does
+// not hold; a missing handler fails the same call and is not one.
+func IsMissingUserErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") && !strings.Contains(msg, "failed to get handler")
+}
+
 // IsExistingTagErr reports whether err is xray's response to adding a handler
 // whose tag is already taken by a running handler.
 func IsExistingTagErr(err error) bool {
@@ -427,6 +479,54 @@ func IsUserExistsErr(err error) bool {
 // config builders run inside the panel process. The xray binary resolves assets
 // relative to its own executable, but the panel binary lives one level above
 // the bin folder, so an explicit location is required.
+// localizeNoiseScripts points each noise mask's relative "script" at the file the xray child loads:
+// xray-core 26.10.17 (#7124) compiles it inside Build, where the panel would look beside its own binary.
+func localizeNoiseScripts(stream *conf.StreamConfig) {
+	if stream == nil || stream.FinalMask == nil {
+		return
+	}
+	for i := range stream.FinalMask.Udp {
+		mask := &stream.FinalMask.Udp[i]
+		if !strings.EqualFold(mask.Type, "noise") || mask.Settings == nil {
+			continue
+		}
+		var settings map[string]any
+		if json.Unmarshal(*mask.Settings, &settings) != nil {
+			continue
+		}
+		script, _ := settings["script"].(string)
+		resolved := childLuaScriptPath(script)
+		if resolved == script {
+			continue
+		}
+		settings["script"] = resolved
+		if raw, err := json.Marshal(settings); err == nil {
+			localized := json.RawMessage(raw)
+			mask.Settings = &localized
+		}
+	}
+}
+
+// childLuaScriptPath resolves a relative Lua script the way the xray child does: it shares the
+// panel's working directory, then looks in its own bin folder instead of the panel's.
+func childLuaScriptPath(script string) string {
+	if script == "" || filepath.IsAbs(script) {
+		return script
+	}
+	if _, err := platform.ResolveLuaFile(script); err == nil {
+		return script
+	}
+	binDir, err := filepath.Abs(config.GetBinFolderPath())
+	if err != nil {
+		return script
+	}
+	inBin := filepath.Join(binDir, script)
+	if _, err := os.Stat(inBin); err != nil {
+		return script
+	}
+	return inBin
+}
+
 func ensureXrayAssetLocation() {
 	if os.Getenv("XRAY_LOCATION_ASSET") != "" || os.Getenv("xray.location.asset") != "" {
 		return
@@ -461,11 +561,90 @@ func collectStringSlice(value any) []string {
 	}
 }
 
+// legacyShadowsocksAccountType is the type URL serial.ToTypedMessage stamps on
+// a pre-2022 shadowsocks account, which identifies the one inbound whose user
+// list tolerates duplicate emails.
+const legacyShadowsocksAccountType = "xray.proxy.shadowsocks.Account"
+
+// shadowsocks2022Ciphers are the methods that select xray's shadowsocks-2022
+// inbound (sing's shadowaead_2022 list). They take a different account type
+// than the legacy AEAD ciphers, and the running inbound casts the account it
+// receives without checking, so a wrong guess takes the whole core down.
+var shadowsocks2022Ciphers = map[string]struct{}{
+	"2022-blake3-aes-128-gcm":       {},
+	"2022-blake3-aes-256-gcm":       {},
+	"2022-blake3-chacha20-poly1305": {},
+}
+
+// shadowsocksCipherName resolves the cipher a shadowsocks user's account must
+// be built for. Panel-built user maps carry it under "cipher"; client objects
+// taken verbatim from an inbound's settings carry the inbound's method under
+// "method" instead (HealShadowsocksClientMethods writes it onto every
+// legacy-cipher client).
+func shadowsocksCipherName(user map[string]any) (string, error) {
+	cipher, err := getOptionalUserString(user, "cipher")
+	if err != nil {
+		return "", err
+	}
+	if cipher != "" {
+		return cipher, nil
+	}
+	return getOptionalUserString(user, "method")
+}
+
+// reverseTag reads a vless reverse proxy tag from either shape a caller can
+// carry: the settings JSON object, or a typed client value marshalling alike.
+func reverseTag(value any) string {
+	if value == nil {
+		return ""
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	var parsed struct {
+		Tag string `json:"tag"`
+	}
+	if json.Unmarshal(raw, &parsed) != nil {
+		return ""
+	}
+	return parsed.Tag
+}
+
+// shadowsocksCipherType mirrors xray-core's infra/conf cipherFromString,
+// aliases and case-insensitivity included, so the account the panel builds for
+// a live user matches the one the core built for that inbound from its config.
+func shadowsocksCipherType(cipher string) shadowsocks.CipherType {
+	switch strings.ToLower(cipher) {
+	case "aes-128-gcm", "aead_aes_128_gcm":
+		return shadowsocks.CipherType_AES_128_GCM
+	case "aes-256-gcm", "aead_aes_256_gcm":
+		return shadowsocks.CipherType_AES_256_GCM
+	case "chacha20-poly1305", "aead_chacha20_poly1305", "chacha20-ietf-poly1305":
+		return shadowsocks.CipherType_CHACHA20_POLY1305
+	case "xchacha20-poly1305", "aead_xchacha20_poly1305", "xchacha20-ietf-poly1305":
+		return shadowsocks.CipherType_XCHACHA20_POLY1305
+	default:
+		return shadowsocks.CipherType_UNKNOWN
+	}
+}
+
+// isShadowsocks2022Cipher reports whether the method selects the
+// shadowsocks-2022 inbound rather than the legacy AEAD one.
+func isShadowsocks2022Cipher(cipher string) bool {
+	_, ok := shadowsocks2022Ciphers[strings.ToLower(cipher)]
+	return ok
+}
+
 // buildUserAccount constructs the typed xray account for a user of the given
 // protocol. It returns (nil, nil) for protocols that cannot be altered live so
 // callers skip the AlterInbound call. WireGuard keys must be converted to the
 // hex form xray's wireguard proxy expects (its ParseKey uses hex.DecodeString),
 // unlike the file-config path which accepts base64 and converts internally.
+// Shadowsocks is resolved strictly from the inbound's cipher: the legacy and
+// 2022 inbounds take different account types and cast whatever they receive
+// without checking, so an unrecognized cipher is an error rather than a guess
+// that would panic the core and kill every connection on the server.
 func buildUserAccount(protocolName string, user map[string]any) (*serial.TypedMessage, error) {
 	switch protocolName {
 	case "vmess":
@@ -491,6 +670,11 @@ func buildUserAccount(protocolName string, user map[string]any) (*serial.TypedMe
 		vlessAccount := &vless.Account{
 			Id:   userID,
 			Flow: userFlow,
+		}
+		// RemoveUser also drops the account's reverse outbound handler, and
+		// GetReverse only rebuilds it from the tag a re-added account carries.
+		if tag := reverseTag(user["reverse"]); tag != "" {
+			vlessAccount.Reverse = &vless.Reverse{Tag: tag}
 		}
 		if testseedVal, ok := user["testseed"]; ok {
 			if testseedArr, ok := testseedVal.([]any); ok && len(testseedArr) >= 4 {
@@ -523,7 +707,7 @@ func buildUserAccount(protocolName string, user map[string]any) (*serial.TypedMe
 			Password: password,
 		}), nil
 	case "shadowsocks":
-		cipher, err := getOptionalUserString(user, "cipher")
+		cipher, err := shadowsocksCipherName(user)
 		if err != nil {
 			return nil, err
 		}
@@ -533,28 +717,19 @@ func buildUserAccount(protocolName string, user map[string]any) (*serial.TypedMe
 			return nil, err
 		}
 
-		var ssCipherType shadowsocks.CipherType
-		switch cipher {
-		case "aes-128-gcm":
-			ssCipherType = shadowsocks.CipherType_AES_128_GCM
-		case "aes-256-gcm":
-			ssCipherType = shadowsocks.CipherType_AES_256_GCM
-		case "chacha20-poly1305", "chacha20-ietf-poly1305":
-			ssCipherType = shadowsocks.CipherType_CHACHA20_POLY1305
-		case "xchacha20-poly1305", "xchacha20-ietf-poly1305":
-			ssCipherType = shadowsocks.CipherType_XCHACHA20_POLY1305
-		default:
-			ssCipherType = shadowsocks.CipherType_UNKNOWN
-		}
-
-		if ssCipherType != shadowsocks.CipherType_UNKNOWN {
-			return serial.ToTypedMessage(&shadowsocks.Account{
-				Password:   password,
-				CipherType: ssCipherType,
+		if isShadowsocks2022Cipher(cipher) {
+			return serial.ToTypedMessage(&shadowsocks_2022.Account{
+				Key: password,
 			}), nil
 		}
-		return serial.ToTypedMessage(&shadowsocks_2022.Account{
-			Key: password,
+
+		ssCipherType := shadowsocksCipherType(cipher)
+		if ssCipherType == shadowsocks.CipherType_UNKNOWN {
+			return nil, common.NewErrorf("shadowsocks: unknown cipher %q, cannot build an account for the running inbound", cipher)
+		}
+		return serial.ToTypedMessage(&shadowsocks.Account{
+			Password:   password,
+			CipherType: ssCipherType,
 		}), nil
 	case "hysteria":
 		auth, err := getRequiredUserString(user, "auth")
@@ -564,6 +739,15 @@ func buildUserAccount(protocolName string, user map[string]any) (*serial.TypedMe
 
 		return serial.ToTypedMessage(&hysteriaAccount.Account{
 			Auth: auth,
+		}), nil
+	case "masque":
+		pass, err := masqueUserPassword(user)
+		if err != nil {
+			return nil, err
+		}
+
+		return serial.ToTypedMessage(&masque.Account{
+			Password: pass,
 		}), nil
 	case "wireguard":
 		pubB64, err := getRequiredUserString(user, "publicKey")
@@ -605,7 +789,20 @@ func buildUserAccount(protocolName string, user map[string]any) (*serial.TypedMe
 	}
 }
 
-// AddUser adds a user to an inbound in the Xray core using the specified protocol and user data.
+// masqueUserPassword reads a MASQUE user's password: panel callers send the client's
+// "password", the hot diff sends the user as emitted for the core, keyed "pass".
+func masqueUserPassword(user map[string]any) (string, error) {
+	if pass, err := getOptionalUserString(user, "pass"); err != nil || pass != "" {
+		return pass, err
+	}
+	return getRequiredUserString(user, "password")
+}
+
+// AddUser adds a user to an inbound in the Xray core using the specified
+// protocol and user data. On a legacy shadowsocks inbound the add first drops
+// any existing holder of the email: that is the one inbound whose validator
+// does not reject a duplicate email, and a later removal would then drop just
+// one of the two registrations, leaving a disabled client able to connect.
 func (x *XrayAPI) AddUser(Protocol string, inboundTag string, user map[string]any) error {
 	userEmail, err := getRequiredUserString(user, "email")
 	if err != nil {
@@ -624,6 +821,10 @@ func (x *XrayAPI) AddUser(Protocol string, inboundTag string, user map[string]an
 		return common.NewError("xray HandlerServiceClient is not initialized")
 	}
 	client := *x.HandlerServiceClient
+
+	if account.Type == legacyShadowsocksAccountType {
+		_ = x.RemoveUser(inboundTag, userEmail)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), handlerRPCTimeout)
 	defer cancel()
@@ -663,7 +864,13 @@ func (x *XrayAPI) RemoveUser(inboundTag, email string) error {
 	return nil
 }
 
-// GetTraffic queries traffic statistics from the Xray core, optionally resetting counters.
+// GetTraffic queries traffic statistics from the Xray core and reports what
+// accrued since the previous call; the counters themselves are never reset.
+// The first call of a process only records baselines, since it may be reading
+// counters that already hold traffic the panel cannot attribute. After that a
+// name the panel has not seen — xray creates a counter on a user's first use —
+// and a counter that moved backwards because the core restarted both count
+// from zero, so no client's traffic is dropped for a whole polling interval.
 func (x *XrayAPI) GetTraffic() ([]*Traffic, []*ClientTraffic, error) {
 	if x.grpcClient == nil {
 		return nil, nil, common.NewError("xray api is not initialized")
@@ -685,12 +892,16 @@ func (x *XrayAPI) GetTraffic() ([]*Traffic, []*ClientTraffic, error) {
 	tagTrafficMap := make(map[string]*Traffic)
 	emailTrafficMap := make(map[string]*ClientTraffic)
 
+	baselinePass := len(x.StatsLastValues) == 0
+
 	for _, stat := range resp.GetStat() {
 		lastValue, ok := x.StatsLastValues[stat.Name]
 		x.StatsLastValues[stat.Name] = stat.Value
-		if !ok || stat.Value < lastValue {
-			// skip first time of seen stat
+		if baselinePass {
 			continue
+		}
+		if !ok || stat.Value < lastValue {
+			lastValue = 0
 		}
 		value := stat.Value - lastValue
 		if matches := trafficRegex.FindStringSubmatch(stat.Name); len(matches) == 4 {

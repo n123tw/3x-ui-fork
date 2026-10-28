@@ -2,8 +2,8 @@ package panel
 
 import (
 	"errors"
+	"time"
 
-	"github.com/xlzd/gotp"
 	"gorm.io/gorm"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
@@ -11,6 +11,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/crypto"
 	ldaputil "github.com/mhsanaei/3x-ui/v3/internal/util/ldap"
+	"github.com/mhsanaei/3x-ui/v3/internal/util/totp"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
 )
 
@@ -33,6 +34,19 @@ func (s *UserService) GetFirstUser() (*model.User, error) {
 		return nil, err
 	}
 	return user, nil
+}
+
+// HasDefaultCredential reports that nobody has chosen the login yet: a database
+// holds no user before the first start, and an older one may still hold admin/admin.
+func (s *UserService) HasDefaultCredential() (bool, error) {
+	user, err := s.GetFirstUser()
+	if database.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return user.Username == "admin" && crypto.CheckPasswordHash(user.Password, "admin"), nil
 }
 
 func (s *UserService) CheckUser(username string, password string, twoFactorCode string) (*model.User, error) {
@@ -97,7 +111,7 @@ func (s *UserService) CheckUser(username string, password string, twoFactorCode 
 			return nil, err
 		}
 
-		if gotp.NewDefaultTOTP(twoFactorToken).Now() != twoFactorCode {
+		if !totp.VerifyWithSkew(twoFactorToken, twoFactorCode, time.Now()) {
 			return nil, errors.New("invalid 2fa code")
 		}
 	}

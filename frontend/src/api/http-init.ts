@@ -79,13 +79,37 @@ function encodeForm(data: unknown): string {
       return;
     }
     if (typeof value === 'object') {
-      Object.entries(value as Record<string, unknown>).forEach(([k, v]) => append(`${key}[${k}]`, v));
+      Object.entries(value as Record<string, unknown>).forEach(([k, v]) =>
+        append(`${key}[${k}]`, v),
+      );
       return;
     }
     parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
   };
   Object.entries(data as Record<string, unknown>).forEach(([k, v]) => append(k, v));
   return parts.join('&');
+}
+
+function appendQuery(url: string, query: string): string {
+  if (query === '') return url;
+  const hashIndex = url.indexOf('#');
+  const path = hashIndex === -1 ? url : url.slice(0, hashIndex);
+  const hash = hashIndex === -1 ? '' : url.slice(hashIndex);
+  const hasQuery = path.includes('?');
+  const separator = !hasQuery ? '?' : path.endsWith('?') || path.endsWith('&') ? '' : '&';
+  return `${path}${separator}${query}${hash}`;
+}
+
+function requestSignal(options: HttpRequestOptions): AbortSignal | undefined {
+  if (!options.timeout) return options.signal;
+  const timeout = AbortSignal.timeout(options.timeout);
+  if (!options.signal) return timeout;
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any([options.signal, timeout]);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  options.signal.addEventListener('abort', abort, { once: true });
+  timeout.addEventListener('abort', abort, { once: true });
+  return controller.signal;
 }
 
 async function performFetch(
@@ -121,8 +145,8 @@ async function performFetch(
   }
 
   const query = encodeForm(options.params);
-  const fullUrl = basePathPrefix + url + (query ? `?${query}` : '');
-  const signal = options.timeout ? AbortSignal.timeout(options.timeout) : options.signal;
+  const fullUrl = basePathPrefix + appendQuery(url, query);
+  const signal = requestSignal(options);
 
   return fetch(fullUrl, { method: upper, headers, body, credentials: 'same-origin', signal });
 }
@@ -170,6 +194,10 @@ export async function httpRequest(
   const parsed = await parseBody(res);
   if (!res.ok) throw new HttpError(res.status, res.statusText, parsed);
   return { ok: true, status: res.status, statusText: res.statusText, data: parsed };
+}
+
+export function withBasePath(path: string): string {
+  return basePathPrefix + path;
 }
 
 export function setupHttp(): void {

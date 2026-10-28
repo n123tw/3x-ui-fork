@@ -24,45 +24,47 @@ type CopyClientsResult struct {
 	Errors  []string `json:"errors"`
 }
 
-// enrichClientStats parses each inbound's clients once, fills in the
-// UUID/SubId fields on the preloaded ClientStats, and tops up rows owned by
-// a sibling inbound (shared-email mode — the row is keyed on email so it
-// only preloads on its owning inbound).
+// enrichClientStats refreshes identities from clients while preserving sibling-owned traffic.
+// The clients table, not the embedded settings JSON, matches the running Xray config (#6436).
 func (s *InboundService) enrichClientStats(db *gorm.DB, inbounds []*model.Inbound) {
 	if len(inbounds) == 0 {
 		return
 	}
 	clientsByInbound := s.backfillClientStats(db, inbounds)
-	for i, inbound := range inbounds {
-		clients := clientsByInbound[i]
+	for _, inbound := range inbounds {
+		clients := clientsByInbound[inbound.Id]
 		if len(clients) == 0 || len(inbound.ClientStats) == 0 {
 			continue
 		}
-		cMap := make(map[string]model.Client, len(clients))
+		cMap := make(map[string]clientStatsIdentity, len(clients))
 		for _, c := range clients {
 			cMap[strings.ToLower(c.Email)] = c
 		}
 		for j := range inbound.ClientStats {
 			email := strings.ToLower(inbound.ClientStats[j].Email)
 			if c, ok := cMap[email]; ok {
-				inbound.ClientStats[j].UUID = c.ID
+				inbound.ClientStats[j].UUID = c.UUID
 				inbound.ClientStats[j].SubId = c.SubID
 			}
 		}
 	}
 }
 
-// backfillClientStats tops up each inbound's preloaded ClientStats with rows
-// owned by a sibling inbound: client_traffics is keyed on email, so a client
-// attached to several inbounds has one row that only preloads on the inbound
-// it was created on. Returns the parsed clients per inbound for reuse.
-func (s *InboundService) backfillClientStats(db *gorm.DB, inbounds []*model.Inbound) [][]model.Client {
-	clientsByInbound := make([][]model.Client, len(inbounds))
+// backfillClientStats loads identities once, then appends missing sibling-owned traffic.
+func (s *InboundService) backfillClientStats(db *gorm.DB, inbounds []*model.Inbound) map[int][]clientStatsIdentity {
+	ids := make([]int, 0, len(inbounds))
+	for _, inbound := range inbounds {
+		ids = append(ids, inbound.Id)
+	}
+	clientsByInbound, err := s.clientService.listStatsIdentitiesForInbounds(db, ids)
+	if err != nil {
+		logger.Warning("backfillClientStats:", err)
+		return nil
+	}
 	seenByInbound := make([]map[string]struct{}, len(inbounds))
 	missing := make(map[string]struct{})
 	for i, inbound := range inbounds {
-		clients, _ := s.GetClients(inbound)
-		clientsByInbound[i] = clients
+		clients := clientsByInbound[inbound.Id]
 		seen := make(map[string]struct{}, len(inbound.ClientStats))
 		for _, st := range inbound.ClientStats {
 			if st.Email != "" {
@@ -102,7 +104,7 @@ func (s *InboundService) backfillClientStats(db *gorm.DB, inbounds []*model.Inbo
 				byEmail[strings.ToLower(st.Email)] = st
 			}
 			for i, inbound := range inbounds {
-				for _, c := range clientsByInbound[i] {
+				for _, c := range clientsByInbound[inbound.Id] {
 					if c.Email == "" {
 						continue
 					}
@@ -121,26 +123,25 @@ func (s *InboundService) backfillClientStats(db *gorm.DB, inbounds []*model.Inbo
 	return clientsByInbound
 }
 
-// emailUsedByOtherInbounds reports whether email lives in any inbound other
-// than exceptInboundId. Empty email returns false.
-func (s *InboundService) emailUsedByOtherInbounds(email string, exceptInboundId int) (bool, error) {
+// emailUsedByOtherInbounds reports whether email lives in any inbound other than
+// exceptInboundId. Inside a transaction pass tx: a pool query there starves the pool.
+func (s *InboundService) emailUsedByOtherInbounds(db *gorm.DB, email string, exceptInboundId int) (bool, error) {
 	if email == "" {
 		return false, nil
 	}
-	db := database.GetDB()
 	var count int64
-	query := fmt.Sprintf(
-		"SELECT COUNT(*) %s WHERE inbounds.id != ? AND LOWER(%s) = LOWER(?)",
-		database.JSONClientsFromInbound(),
-		database.JSONFieldText("client.value", "email"),
-	)
-	if err := db.Raw(query, exceptInboundId, email).Scan(&count).Error; err != nil {
+	err := db.Table("client_inbounds").
+		Joins("JOIN clients ON clients.id = client_inbounds.client_id").
+		Where("client_inbounds.inbound_id != ? AND LOWER(clients.email) = ?",
+			exceptInboundId, strings.ToLower(strings.TrimSpace(email))).
+		Count(&count).Error
+	if err != nil {
 		return false, err
 	}
 	return count > 0, nil
 }
 
-func (s *InboundService) emailsUsedByOtherInbounds(emails []string, exceptInboundId int) (map[string]bool, error) {
+func (s *InboundService) emailsUsedByOtherInbounds(db *gorm.DB, emails []string, exceptInboundId int) (map[string]bool, error) {
 	shared := make(map[string]bool, len(emails))
 	want := make(map[string]struct{}, len(emails))
 	for _, e := range emails {
@@ -152,20 +153,22 @@ func (s *InboundService) emailsUsedByOtherInbounds(emails []string, exceptInboun
 	if len(want) == 0 {
 		return shared, nil
 	}
-	db := database.GetDB()
-	var rows []string
-	query := fmt.Sprintf(
-		"SELECT DISTINCT LOWER(%s) %s WHERE inbounds.id != ?",
-		database.JSONFieldText("client.value", "email"),
-		database.JSONClientsFromInbound(),
-	)
-	if err := db.Raw(query, exceptInboundId).Scan(&rows).Error; err != nil {
-		return nil, err
+	lowered := make([]string, 0, len(want))
+	for e := range want {
+		lowered = append(lowered, e)
 	}
-	for _, e := range rows {
-		e = strings.ToLower(strings.TrimSpace(e))
-		if _, ok := want[e]; ok {
-			shared[e] = true
+	for _, batch := range chunkStrings(lowered, sqlInChunk) {
+		var rows []struct{ Email string }
+		err := db.Table("client_inbounds").
+			Joins("JOIN clients ON clients.id = client_inbounds.client_id").
+			Select("DISTINCT LOWER(clients.email) AS email").
+			Where("client_inbounds.inbound_id != ? AND LOWER(clients.email) IN ?", exceptInboundId, batch).
+			Scan(&rows).Error
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			shared[r.Email] = true
 		}
 	}
 	return shared, nil
@@ -221,15 +224,19 @@ func (s *InboundService) buildTargetClientFromSource(source model.Client, target
 	case model.VLESS:
 		target.ID = s.generateRandomCredential(targetProtocol)
 		if (flow == "xtls-rprx-vision" || flow == "xtls-rprx-vision-udp443") &&
+			!targetInbound.DisableFlow &&
 			inboundCanEnableTlsFlow(string(targetProtocol), targetInbound.StreamSettings, targetInbound.Settings) {
 			target.Flow = flow
 		}
-	case model.Trojan, model.Shadowsocks:
+	case model.Trojan, model.Shadowsocks, model.MASQUE:
 		target.Password = s.generateRandomCredential(targetProtocol)
 	case model.Hysteria:
 		target.Auth = s.generateRandomCredential(targetProtocol)
 	case model.MTProto:
 		target.Secret = model.GenerateFakeTLSSecret(mtprotoDomainFromSettings(targetInbound.Settings))
+	case model.TUIC:
+		target.ID = uuid.NewString()
+		target.Password = s.generateRandomCredential(targetProtocol)
 	default:
 		target.ID = s.generateRandomCredential(targetProtocol)
 	}
