@@ -48,6 +48,7 @@ services:
       - "2053:2053"
       - "8443:8443"
       - "8443:8443/udp"
+      - "443:443/udp"
       - "53246:53246/udp"
     restart: unless-stopped
 
